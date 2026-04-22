@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """
-THD Distributed Link Collector
-================================
-Collects image URLs + product metadata via GraphQL. No image downloads.
-
-Each machine auto-claims a shard via git, collects links, pushes results back.
-
-Output per shard:
-    tasks/results/shard_{id}_done.json   -- completion marker + stats
-    tasks/links/shard_{id}_links.jsonl   -- one line per image URL
-
-Each JSONL line:
-    {
-        "omsid":      "314427520",
-        "page_url":   "https://www.homedepot.com/p/.../314427520",
-        "category":   "Cordless Circular Saw",
-        "brand":      "DEWALT",
-        "model":      "DCS565B",
-        "label":      "20V MAX Cordless 6.5 in. Circular Saw",
-        "img_url":    "https://images.thdstatic.com/...",
-        "img_type":   "IMAGE",
-        "img_subtype": "PRIMARY"
-    }
+THD Distributed Link Collector — v2 with Smart Rate Limit Handling
+===================================================================
+Key improvement: detects 206 rate limit, auto-pauses until IP recovers,
+then resumes. Single IP does ~180 req → pause 10-20 min → repeat.
+Runs continuously through multiple shards with --auto.
 
 Usage:
     pip install curl_cffi
 
-    python crawler.py --auto       # auto-claim next shard and run
-    python crawler.py --shard 001  # run specific shard
-    python crawler.py --list       # show progress
+    python crawler.py --auto                 # claim shards and run until all done
+    python crawler.py --auto --max-shards 5  # run up to 5 shards then stop
+    python crawler.py --shard 001            # run specific shard
+    python crawler.py --list                 # show progress
     python crawler.py --shard 001 --dry-run
 """
 
@@ -36,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import socket
 import subprocess
@@ -58,9 +43,14 @@ RESULTS_DIR = TASKS_DIR / "results"
 LINKS_DIR   = TASKS_DIR / "links"
 
 GRAPHQL_URL = "https://www.homedepot.com/federation-gateway/graphql"
-PAGE_DELAY      = 2.0   # seconds between requests
-PAGE_DELAY_MAX  = 10.0  # max delay after repeated rate limits
-IMAGE_SIZE      = 1000  # preferred resolution
+IMAGE_SIZE  = 1000
+
+# --- Rate limit tuning ---
+BURST_SIZE     = 180    # requests before proactive pause (HD triggers 206 at ~200)
+BURST_DELAY    = 2.5    # seconds between requests in a burst
+COOLDOWN_PROBE = 120    # seconds between probe attempts during cooldown
+COOLDOWN_MAX   = 1800   # max cooldown (30 min)
+JITTER         = 0.5    # ± random jitter on delays
 
 API_HEADERS = {
     "Accept": "application/json",
@@ -84,6 +74,90 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiter — the core anti-206 logic
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Tracks request budget per IP. Pauses proactively before 206,
+    and reactively recovers if 206 is hit."""
+
+    def __init__(self):
+        self.requests_in_burst = 0
+        self.total_requests = 0
+        self.total_206 = 0
+        self.cooldowns = 0
+
+    def pre_request(self):
+        """Called before each request. Proactively pauses if near limit."""
+        if self.requests_in_burst >= BURST_SIZE:
+            self._proactive_cooldown()
+
+    def post_request(self, status_code):
+        """Called after request. Returns True if OK."""
+        self.total_requests += 1
+        if status_code == 200:
+            self.requests_in_burst += 1
+            return True
+        elif status_code == 206:
+            self.total_206 += 1
+            self._reactive_cooldown()
+            return False
+        return False
+
+    def _proactive_cooldown(self):
+        """Pause BEFORE hitting rate limit. Shorter wait."""
+        pause = random.uniform(600, 900)  # 10-15 min
+        self.cooldowns += 1
+        log.info(
+            f"💤 Proactive pause after {self.requests_in_burst} requests. "
+            f"Sleeping {pause/60:.0f} min. "
+            f"(Total: {self.total_requests} req, {self.cooldowns} pauses)"
+        )
+        time.sleep(pause)
+        self.requests_in_burst = 0
+
+    def _reactive_cooldown(self):
+        """Got 206. Wait until IP recovers, probing periodically."""
+        log.warning(
+            f"🔴 Rate limited (206) at {self.requests_in_burst} requests. "
+            f"Probing every {COOLDOWN_PROBE}s until recovered..."
+        )
+        self.requests_in_burst = 0
+        waited = 0
+        probe_session = cffi_requests.Session()
+
+        while waited < COOLDOWN_MAX:
+            time.sleep(COOLDOWN_PROBE)
+            waited += COOLDOWN_PROBE
+            try:
+                resp = probe_session.post(
+                    f"{GRAPHQL_URL}?opname=productClientOnlyProduct",
+                    headers=API_HEADERS,
+                    json={
+                        "operationName": "productClientOnlyProduct",
+                        "variables": {"itemId": "203164241"},
+                        "query": PRODUCT_MEDIA_QUERY,
+                    },
+                    impersonate="chrome", timeout=10,
+                )
+                if resp.status_code == 200:
+                    log.info(f"🟢 Recovered after {waited/60:.0f} min!")
+                    return
+                log.info(f"  Still 206... ({waited/60:.0f} min)")
+            except Exception:
+                log.info(f"  Probe failed... ({waited/60:.0f} min)")
+
+        log.warning(f"⚠️  Not recovered after {COOLDOWN_MAX/60:.0f} min. Continuing anyway.")
+
+    def stats_dict(self):
+        return {
+            "total_requests": self.total_requests,
+            "total_206": self.total_206,
+            "cooldowns": self.cooldowns,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -173,12 +247,16 @@ def auto_claim():
 # GraphQL fetch
 # ---------------------------------------------------------------------------
 
-def graphql_fetch(session, omsid):
+def graphql_fetch(session, omsid, rate_limiter):
+    """Fetch product data. Rate limiter handles 206 automatically."""
     payload = {
         "operationName": "productClientOnlyProduct",
         "variables": {"itemId": omsid},
         "query": PRODUCT_MEDIA_QUERY,
     }
+
+    rate_limiter.pre_request()
+
     for attempt in range(3):
         try:
             r = session.post(
@@ -190,14 +268,11 @@ def graphql_fetch(session, omsid):
             return [], None, str(e)
 
         if r.status_code == 206:
-            wait = 30 * (attempt + 1)
-            log.warning(
-                f"  ⚠️  IP RATE LIMITED (HTTP 206) — HD limits ~500 req/IP/day. "
-                f"Backing off {wait}s (attempt {attempt+1}/3). "
-                f"If this persists, switch IP/VPN."
-            )
-            time.sleep(wait)
-            continue
+            rate_limiter.post_request(206)
+            continue  # rate limiter already waited; retry
+
+        rate_limiter.post_request(r.status_code)
+
         if r.status_code != 200:
             return [], None, f"HTTP {r.status_code}"
 
@@ -237,7 +312,7 @@ def graphql_fetch(session, omsid):
 # Shard runner
 # ---------------------------------------------------------------------------
 
-def run_shard(shard_id, dry_run=False):
+def run_shard(shard_id, dry_run=False, rate_limiter=None):
     shard_file  = SHARDS_DIR / f"shard_{shard_id}.json"
     result_file = RESULTS_DIR / f"shard_{shard_id}_done.json"
 
@@ -246,7 +321,7 @@ def run_shard(shard_id, dry_run=False):
         sys.exit(1)
     if result_file.exists():
         log.info(f"Shard {shard_id} already completed.")
-        return
+        return rate_limiter
 
     shard    = json.loads(shard_file.read_text())
     products = shard["products"]
@@ -256,14 +331,16 @@ def run_shard(shard_id, dry_run=False):
         log.info("[DRY RUN] first 5 products:")
         for p in products[:5]:
             log.info(f"  {p['omsid']} ({p.get('category','?')}) — {p['url']}")
-        return
+        return rate_limiter
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     LINKS_DIR.mkdir(parents=True, exist_ok=True)
 
     links_file = LINKS_DIR / f"shard_{shard_id}_links.jsonl"
+    if rate_limiter is None:
+        rate_limiter = RateLimiter()
 
-    # --- Resume: read any already-collected omsids from the JSONL file ---
+    # --- Resume: read already-collected omsids ---
     processed = set()
     existing_links = 0
     if links_file.exists():
@@ -275,108 +352,89 @@ def run_shard(shard_id, dry_run=False):
                 except Exception:
                     pass
         if processed:
-            log.info(
-                f"Resume detected: {len(processed)} products already collected "
-                f"({existing_links} links). Will skip them and continue."
-            )
+            log.info(f"Resume: {len(processed)} products done ({existing_links} links). Continuing...")
 
     session = cffi_requests.Session()
-
     stats = {
-        "shard_id":         shard_id,
-        "machine":          socket.gethostname(),
-        "started_at":       datetime.now().isoformat(),
-        "products_total":   len(products),
-        "products_ok":      len(processed),
-        "products_failed":  0,
+        "shard_id":          shard_id,
+        "machine":           socket.gethostname(),
+        "started_at":        datetime.now().isoformat(),
+        "products_total":    len(products),
+        "products_ok":       len(processed),
+        "products_failed":   0,
         "products_no_media": 0,
-        "links_collected":  existing_links,
-        "resumed":          len(processed) > 0,
+        "links_collected":   existing_links,
     }
-
     consecutive_errors = 0
-    current_delay = PAGE_DELAY
-    rate_limit_hits = 0
 
-    # Open in APPEND mode so resumes preserve existing links
     with links_file.open("a", encoding="utf-8") as f:
         for i, product in enumerate(products):
-            omsid    = product["omsid"]
-            page_url = product.get("url", f"https://www.homedepot.com/p/{omsid}")
-            category = product.get("category", "other")
-
-            # Resume: skip products we've already collected links for
+            omsid = product["omsid"]
             if omsid in processed:
                 continue
 
-            if (i + 1) % 100 == 0:
-                eta = (len(products) - i - 1) * current_delay / 60
+            page_url = product.get("url", f"https://www.homedepot.com/p/{omsid}")
+            category = product.get("category", "other")
+
+            if (i + 1) % 50 == 0:
                 log.info(
                     f"[{i+1}/{len(products)}] {(i+1)/len(products)*100:.0f}% | "
-                    f"~{eta:.0f}min | {stats['links_collected']} links | "
-                    f"delay={current_delay:.1f}s | rate_limits={rate_limit_hits}"
+                    f"{stats['links_collected']} links | "
+                    f"burst={rate_limiter.requests_in_burst}/{BURST_SIZE} | "
+                    f"206s={rate_limiter.total_206} | pauses={rate_limiter.cooldowns}"
                 )
 
-            images, info, err = graphql_fetch(session, omsid)
+            images, info, err = graphql_fetch(session, omsid, rate_limiter)
 
             if err:
                 consecutive_errors += 1
                 stats["products_failed"] += 1
-                if "206" in str(err) or "max retries" in str(err):
-                    rate_limit_hits += 1
-                    # Slow down globally when rate limited
-                    current_delay = min(PAGE_DELAY_MAX, current_delay * 1.5)
-                    log.warning(
-                        f"  ⚠️  Rate limit detected — slowing to {current_delay:.1f}s/req. "
-                        f"Total rate limit hits: {rate_limit_hits}. "
-                        f"Consider switching IP if this keeps happening."
-                    )
-                else:
-                    log.warning(f"  FAIL {omsid}: {err[:80]}")
-                if consecutive_errors >= 30:
-                    log.error("30 consecutive errors — aborting shard. Switch IP and re-run.")
+                if consecutive_errors >= 50:
+                    log.error("50 consecutive errors — aborting shard.")
                     break
-                if consecutive_errors >= 5:
-                    time.sleep(min(120, consecutive_errors * 10))
-                time.sleep(current_delay)
+                if "max retries" not in str(err):
+                    log.warning(f"  FAIL {omsid}: {err[:80]}")
+                delay = BURST_DELAY + random.uniform(-JITTER, JITTER)
+                time.sleep(max(0.5, delay))
                 continue
 
             consecutive_errors = 0
-            # Gradually recover delay after clean run
-            if current_delay > PAGE_DELAY and i % 20 == 0:
-                current_delay = max(PAGE_DELAY, current_delay * 0.9)
-
             if not images:
                 stats["products_no_media"] += 1
-                time.sleep(PAGE_DELAY)
+                time.sleep(BURST_DELAY + random.uniform(-JITTER, JITTER))
                 continue
 
             for img in images:
                 row = {
-                    "omsid":       omsid,
-                    "page_url":    page_url,
-                    "category":    category,
-                    "brand":       info.get("brand", ""),
-                    "model":       info.get("model", ""),
-                    "label":       info.get("label", ""),
+                    "omsid":    omsid,
+                    "page_url": page_url,
+                    "category": category,
+                    "brand":    info.get("brand", ""),
+                    "model":    info.get("model", ""),
+                    "label":    info.get("label", ""),
                     **img,
                 }
                 f.write(json.dumps(row) + "\n")
                 stats["links_collected"] += 1
-            f.flush()  # survive kill -9
+            f.flush()
             os.fsync(f.fileno())
             processed.add(omsid)
             stats["products_ok"] += 1
-            time.sleep(current_delay)
+            time.sleep(BURST_DELAY + random.uniform(-JITTER, JITTER))
 
-    stats.update({"rate_limit_hits": rate_limit_hits, "finished_at": datetime.now().isoformat(), "status": "done"})
+    stats.update({
+        "finished_at": datetime.now().isoformat(),
+        "status": "done",
+        **rate_limiter.stats_dict(),
+    })
     result_file.write_text(json.dumps(stats, indent=2))
     git_push_result(shard_id, [result_file, links_file])
 
     log.info("=" * 55)
-    log.info(f"SHARD {shard_id} DONE — {stats['links_collected']} links collected")
-    log.info(f"  Links file: {links_file}")
+    log.info(f"SHARD {shard_id} DONE — {stats['links_collected']} links")
+    log.info(f"  Rate: {rate_limiter.total_206} 206s, {rate_limiter.cooldowns} cooldowns")
     log.info("=" * 55)
+    return rate_limiter
 
 
 # ---------------------------------------------------------------------------
@@ -429,20 +487,34 @@ def list_shards():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="THD Distributed Link Collector")
+    parser = argparse.ArgumentParser(description="THD Distributed Link Collector v2")
     group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--auto",  action="store_true", help="Auto-claim and run next pending shard")
-    group.add_argument("--shard", metavar="NNN",       help="Run specific shard (e.g. 001)")
-    group.add_argument("--list",  action="store_true", help="Show all shards and status")
-    parser.add_argument("--dry-run", action="store_true")
+    group.add_argument("--auto",  action="store_true",
+                       help="Claim shards and run continuously until all done")
+    group.add_argument("--shard", metavar="NNN",
+                       help="Run specific shard (e.g. 001)")
+    group.add_argument("--list",  action="store_true",
+                       help="Show all shards and status")
+    parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--max-shards", type=int, default=999,
+                        help="Max shards to run (default: all)")
     args = parser.parse_args()
 
     if args.list:
         list_shards()
     elif args.auto:
-        shard_id = auto_claim()
-        if shard_id:
-            run_shard(shard_id, dry_run=args.dry_run)
+        rate_limiter = RateLimiter()
+        done = 0
+        while done < args.max_shards:
+            shard_id = auto_claim()
+            if shard_id is None:
+                break
+            rate_limiter = run_shard(
+                shard_id, dry_run=args.dry_run, rate_limiter=rate_limiter
+            ) or rate_limiter
+            done += 1
+            log.info(f"✅ {done} shards completed. Claiming next...")
+        log.info(f"🏁 Finished {done} shards. Total: {rate_limiter.total_requests} req, {rate_limiter.total_206} 206s")
     else:
         run_shard(args.shard.zfill(3), dry_run=args.dry_run)
 
