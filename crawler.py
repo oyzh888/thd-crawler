@@ -262,28 +262,52 @@ def run_shard(shard_id, dry_run=False):
     LINKS_DIR.mkdir(parents=True, exist_ok=True)
 
     links_file = LINKS_DIR / f"shard_{shard_id}_links.jsonl"
-    session    = cffi_requests.Session()
+
+    # --- Resume: read any already-collected omsids from the JSONL file ---
+    processed = set()
+    existing_links = 0
+    if links_file.exists():
+        with links_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    processed.add(json.loads(line)["omsid"])
+                    existing_links += 1
+                except Exception:
+                    pass
+        if processed:
+            log.info(
+                f"Resume detected: {len(processed)} products already collected "
+                f"({existing_links} links). Will skip them and continue."
+            )
+
+    session = cffi_requests.Session()
 
     stats = {
         "shard_id":         shard_id,
         "machine":          socket.gethostname(),
         "started_at":       datetime.now().isoformat(),
         "products_total":   len(products),
-        "products_ok":      0,
+        "products_ok":      len(processed),
         "products_failed":  0,
         "products_no_media": 0,
-        "links_collected":  0,
+        "links_collected":  existing_links,
+        "resumed":          len(processed) > 0,
     }
 
     consecutive_errors = 0
     current_delay = PAGE_DELAY
     rate_limit_hits = 0
 
-    with links_file.open("w", encoding="utf-8") as f:
+    # Open in APPEND mode so resumes preserve existing links
+    with links_file.open("a", encoding="utf-8") as f:
         for i, product in enumerate(products):
             omsid    = product["omsid"]
             page_url = product.get("url", f"https://www.homedepot.com/p/{omsid}")
             category = product.get("category", "other")
+
+            # Resume: skip products we've already collected links for
+            if omsid in processed:
+                continue
 
             if (i + 1) % 100 == 0:
                 eta = (len(products) - i - 1) * current_delay / 60
@@ -339,7 +363,9 @@ def run_shard(shard_id, dry_run=False):
                 }
                 f.write(json.dumps(row) + "\n")
                 stats["links_collected"] += 1
-
+            f.flush()  # survive kill -9
+            os.fsync(f.fileno())
+            processed.add(omsid)
             stats["products_ok"] += 1
             time.sleep(current_delay)
 
