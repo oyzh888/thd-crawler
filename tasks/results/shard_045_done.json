@@ -1,0 +1,15 @@
+{
+  "shard_id": "045",
+  "machine": "finance-bench-v3",
+  "started_at": "2026-04-22T09:23:55.344912",
+  "products_total": 500,
+  "products_ok": 0,
+  "products_failed": 50,
+  "products_no_media": 0,
+  "links_collected": 0,
+  "finished_at": "2026-04-22T09:26:01.700613",
+  "status": "done",
+  "total_requests": 50,
+  "total_206": 0,
+  "cooldowns": 0
+}
