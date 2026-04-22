@@ -1,0 +1,475 @@
+{
+  "total_products": 38545,
+  "shard_size": 500,
+  "n_shards": 78,
+  "shards": [
+    {
+      "shard_id": "001",
+      "product_count": 500,
+      "start": 0,
+      "end": 499
+    },
+    {
+      "shard_id": "002",
+      "product_count": 500,
+      "start": 500,
+      "end": 999
+    },
+    {
+      "shard_id": "003",
+      "product_count": 500,
+      "start": 1000,
+      "end": 1499
+    },
+    {
+      "shard_id": "004",
+      "product_count": 500,
+      "start": 1500,
+      "end": 1999
+    },
+    {
+      "shard_id": "005",
+      "product_count": 500,
+      "start": 2000,
+      "end": 2499
+    },
+    {
+      "shard_id": "006",
+      "product_count": 500,
+      "start": 2500,
+      "end": 2999
+    },
+    {
+      "shard_id": "007",
+      "product_count": 500,
+      "start": 3000,
+      "end": 3499
+    },
+    {
+      "shard_id": "008",
+      "product_count": 500,
+      "start": 3500,
+      "end": 3999
+    },
+    {
+      "shard_id": "009",
+      "product_count": 500,
+      "start": 4000,
+      "end": 4499
+    },
+    {
+      "shard_id": "010",
+      "product_count": 500,
+      "start": 4500,
+      "end": 4999
+    },
+    {
+      "shard_id": "011",
+      "product_count": 500,
+      "start": 5000,
+      "end": 5499
+    },
+    {
+      "shard_id": "012",
+      "product_count": 500,
+      "start": 5500,
+      "end": 5999
+    },
+    {
+      "shard_id": "013",
+      "product_count": 500,
+      "start": 6000,
+      "end": 6499
+    },
+    {
+      "shard_id": "014",
+      "product_count": 500,
+      "start": 6500,
+      "end": 6999
+    },
+    {
+      "shard_id": "015",
+      "product_count": 500,
+      "start": 7000,
+      "end": 7499
+    },
+    {
+      "shard_id": "016",
+      "product_count": 500,
+      "start": 7500,
+      "end": 7999
+    },
+    {
+      "shard_id": "017",
+      "product_count": 500,
+      "start": 8000,
+      "end": 8499
+    },
+    {
+      "shard_id": "018",
+      "product_count": 500,
+      "start": 8500,
+      "end": 8999
+    },
+    {
+      "shard_id": "019",
+      "product_count": 500,
+      "start": 9000,
+      "end": 9499
+    },
+    {
+      "shard_id": "020",
+      "product_count": 500,
+      "start": 9500,
+      "end": 9999
+    },
+    {
+      "shard_id": "021",
+      "product_count": 500,
+      "start": 10000,
+      "end": 10499
+    },
+    {
+      "shard_id": "022",
+      "product_count": 500,
+      "start": 10500,
+      "end": 10999
+    },
+    {
+      "shard_id": "023",
+      "product_count": 500,
+      "start": 11000,
+      "end": 11499
+    },
+    {
+      "shard_id": "024",
+      "product_count": 500,
+      "start": 11500,
+      "end": 11999
+    },
+    {
+      "shard_id": "025",
+      "product_count": 500,
+      "start": 12000,
+      "end": 12499
+    },
+    {
+      "shard_id": "026",
+      "product_count": 500,
+      "start": 12500,
+      "end": 12999
+    },
+    {
+      "shard_id": "027",
+      "product_count": 500,
+      "start": 13000,
+      "end": 13499
+    },
+    {
+      "shard_id": "028",
+      "product_count": 500,
+      "start": 13500,
+      "end": 13999
+    },
+    {
+      "shard_id": "029",
+      "product_count": 500,
+      "start": 14000,
+      "end": 14499
+    },
+    {
+      "shard_id": "030",
+      "product_count": 500,
+      "start": 14500,
+      "end": 14999
+    },
+    {
+      "shard_id": "031",
+      "product_count": 500,
+      "start": 15000,
+      "end": 15499
+    },
+    {
+      "shard_id": "032",
+      "product_count": 500,
+      "start": 15500,
+      "end": 15999
+    },
+    {
+      "shard_id": "033",
+      "product_count": 500,
+      "start": 16000,
+      "end": 16499
+    },
+    {
+      "shard_id": "034",
+      "product_count": 500,
+      "start": 16500,
+      "end": 16999
+    },
+    {
+      "shard_id": "035",
+      "product_count": 500,
+      "start": 17000,
+      "end": 17499
+    },
+    {
+      "shard_id": "036",
+      "product_count": 500,
+      "start": 17500,
+      "end": 17999
+    },
+    {
+      "shard_id": "037",
+      "product_count": 500,
+      "start": 18000,
+      "end": 18499
+    },
+    {
+      "shard_id": "038",
+      "product_count": 500,
+      "start": 18500,
+      "end": 18999
+    },
+    {
+      "shard_id": "039",
+      "product_count": 500,
+      "start": 19000,
+      "end": 19499
+    },
+    {
+      "shard_id": "040",
+      "product_count": 500,
+      "start": 19500,
+      "end": 19999
+    },
+    {
+      "shard_id": "041",
+      "product_count": 500,
+      "start": 20000,
+      "end": 20499
+    },
+    {
+      "shard_id": "042",
+      "product_count": 500,
+      "start": 20500,
+      "end": 20999
+    },
+    {
+      "shard_id": "043",
+      "product_count": 500,
+      "start": 21000,
+      "end": 21499
+    },
+    {
+      "shard_id": "044",
+      "product_count": 500,
+      "start": 21500,
+      "end": 21999
+    },
+    {
+      "shard_id": "045",
+      "product_count": 500,
+      "start": 22000,
+      "end": 22499
+    },
+    {
+      "shard_id": "046",
+      "product_count": 500,
+      "start": 22500,
+      "end": 22999
+    },
+    {
+      "shard_id": "047",
+      "product_count": 500,
+      "start": 23000,
+      "end": 23499
+    },
+    {
+      "shard_id": "048",
+      "product_count": 500,
+      "start": 23500,
+      "end": 23999
+    },
+    {
+      "shard_id": "049",
+      "product_count": 500,
+      "start": 24000,
+      "end": 24499
+    },
+    {
+      "shard_id": "050",
+      "product_count": 500,
+      "start": 24500,
+      "end": 24999
+    },
+    {
+      "shard_id": "051",
+      "product_count": 500,
+      "start": 25000,
+      "end": 25499
+    },
+    {
+      "shard_id": "052",
+      "product_count": 500,
+      "start": 25500,
+      "end": 25999
+    },
+    {
+      "shard_id": "053",
+      "product_count": 500,
+      "start": 26000,
+      "end": 26499
+    },
+    {
+      "shard_id": "054",
+      "product_count": 500,
+      "start": 26500,
+      "end": 26999
+    },
+    {
+      "shard_id": "055",
+      "product_count": 500,
+      "start": 27000,
+      "end": 27499
+    },
+    {
+      "shard_id": "056",
+      "product_count": 500,
+      "start": 27500,
+      "end": 27999
+    },
+    {
+      "shard_id": "057",
+      "product_count": 500,
+      "start": 28000,
+      "end": 28499
+    },
+    {
+      "shard_id": "058",
+      "product_count": 500,
+      "start": 28500,
+      "end": 28999
+    },
+    {
+      "shard_id": "059",
+      "product_count": 500,
+      "start": 29000,
+      "end": 29499
+    },
+    {
+      "shard_id": "060",
+      "product_count": 500,
+      "start": 29500,
+      "end": 29999
+    },
+    {
+      "shard_id": "061",
+      "product_count": 500,
+      "start": 30000,
+      "end": 30499
+    },
+    {
+      "shard_id": "062",
+      "product_count": 500,
+      "start": 30500,
+      "end": 30999
+    },
+    {
+      "shard_id": "063",
+      "product_count": 500,
+      "start": 31000,
+      "end": 31499
+    },
+    {
+      "shard_id": "064",
+      "product_count": 500,
+      "start": 31500,
+      "end": 31999
+    },
+    {
+      "shard_id": "065",
+      "product_count": 500,
+      "start": 32000,
+      "end": 32499
+    },
+    {
+      "shard_id": "066",
+      "product_count": 500,
+      "start": 32500,
+      "end": 32999
+    },
+    {
+      "shard_id": "067",
+      "product_count": 500,
+      "start": 33000,
+      "end": 33499
+    },
+    {
+      "shard_id": "068",
+      "product_count": 500,
+      "start": 33500,
+      "end": 33999
+    },
+    {
+      "shard_id": "069",
+      "product_count": 500,
+      "start": 34000,
+      "end": 34499
+    },
+    {
+      "shard_id": "070",
+      "product_count": 500,
+      "start": 34500,
+      "end": 34999
+    },
+    {
+      "shard_id": "071",
+      "product_count": 500,
+      "start": 35000,
+      "end": 35499
+    },
+    {
+      "shard_id": "072",
+      "product_count": 500,
+      "start": 35500,
+      "end": 35999
+    },
+    {
+      "shard_id": "073",
+      "product_count": 500,
+      "start": 36000,
+      "end": 36499
+    },
+    {
+      "shard_id": "074",
+      "product_count": 500,
+      "start": 36500,
+      "end": 36999
+    },
+    {
+      "shard_id": "075",
+      "product_count": 500,
+      "start": 37000,
+      "end": 37499
+    },
+    {
+      "shard_id": "076",
+      "product_count": 500,
+      "start": 37500,
+      "end": 37999
+    },
+    {
+      "shard_id": "077",
+      "product_count": 500,
+      "start": 38000,
+      "end": 38499
+    },
+    {
+      "shard_id": "078",
+      "product_count": 45,
+      "start": 38500,
+      "end": 38544
+    }
+  ]
+}
