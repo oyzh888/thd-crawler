@@ -1,6 +1,7 @@
-# THD Distributed Image Crawler
+# THD Distributed Link Collector
 
-Scrapes ~38,500 Home Depot products split into **78 shards** (~500 products each).
+Collects image URLs + product metadata from ~38,500 Home Depot products, split into **78 shards** (~500 products each). **No images are downloaded** — only links + relationships.
+
 Each machine claims one shard via git, runs it, pushes results back.
 
 ## Quick Start (each machine)
@@ -14,12 +15,44 @@ pip install curl_cffi
 python crawler.py --auto
 ```
 
-That's it. The script will:
+The script will:
 1. `git pull` to see what's already claimed
-2. Write `tasks/claims/shard_NNN.json` and push (atomic claim)
-3. If two machines race for the same shard, one push wins — the other retries automatically
-4. Download all images to `images/NNN/{category}/{omsid}/`
+2. Write `tasks/claims/shard_NNN.json` and push (atomic claim via git)
+3. If two machines race, one push wins — the other auto-retries next shard
+4. Collect image URLs + metadata to `tasks/links/shard_NNN_links.jsonl`
 5. Write `tasks/results/shard_NNN_done.json` and push when finished
+
+## Output Format
+
+`tasks/links/shard_NNN_links.jsonl` — one line per image URL:
+
+```json
+{
+  "omsid":      "314427520",
+  "page_url":   "https://www.homedepot.com/p/.../314427520",
+  "category":   "Cordless Circular Saw",
+  "brand":      "DEWALT",
+  "model":      "DCS565B",
+  "label":      "20V MAX Cordless 6.5 in. Circular Saw",
+  "img_url":    "https://images.thdstatic.com/productImages/...jpg",
+  "img_type":   "IMAGE",
+  "img_subtype": "PRIMARY"
+}
+```
+
+## Resume Support (auto)
+
+If your machine gets rate-limited or killed mid-shard, **just re-run the same shard**. The script will:
+
+1. Read your existing `shard_NNN_links.jsonl`
+2. Detect which `omsid`s are already collected
+3. Skip them and continue from where you left off
+
+```bash
+python crawler.py --shard 007    # resumes automatically if partial data exists
+```
+
+Each product's links are `fsync`'d to disk immediately, so even `kill -9` won't lose more than the in-flight request.
 
 ## Check Progress
 
@@ -28,13 +61,13 @@ python crawler.py --list
 ```
 
 ```
-Progress: 12/78 done | 3 in-progress | 63 pending
+Progress: 12/78 done | 3 running | 63 pending | 42,135 links collected
 
 Shard    Products   Status
 ---------------------------------------------
-  001    500        ✓ done
-  002    500        ✓ done
-  003    500        ⟳ MacBook-Pro-Minhou    ← someone is running this
+  001    500        ✓ done (3,521 links)
+  002    500        ✓ done (4,018 links)
+  003    500        ⟳ MacBook-Pro-Minhou
   004    500        · pending
   ...
 ```
@@ -45,14 +78,14 @@ Shard    Products   Status
 |---|---|
 | Total products | 38,545 |
 | Shards | 78 × 500 products |
-| Est. images | ~350,000 |
-| Est. time per shard | ~15 min |
+| Est. total links | ~300,000 |
+| Est. time per shard | ~15 min (residential IP) |
 | With 10 machines | ~2 hours total |
 
-## Manual shard
+## Manual shard / dry run
 
 ```bash
-python crawler.py --shard 007          # run shard 007 specifically
+python crawler.py --shard 007          # run specific shard
 python crawler.py --shard 007 --dry-run  # preview without requests
 ```
 
@@ -62,31 +95,35 @@ HD GraphQL endpoint (`homedepot.com/federation-gateway/graphql`) has IP-level ra
 
 | Rule | Detail |
 |------|--------|
-| **Safe throughput** | 1 instance per IP, PAGE_DELAY ≥ 1.5s |
+| **Safe throughput** | 1 instance per IP, PAGE_DELAY ≥ 2s |
 | **Datacenter IP limit** | ~200 requests then HTTP 206 |
-| **Residential IP limit** | No limit observed (ran 500+ requests) |
+| **Residential IP limit** | ~500 requests/day (rough estimate) |
 | **Parallel from same IP** | ❌ 3+ instances → 206 within 30 seconds |
 | **Recovery time** | 10+ minutes after being blocked (possibly longer) |
 | **CDN (images.thdstatic.com)** | No rate limit, unlimited parallel |
 
-### 206 Response (rate limited)
+### What 206 looks like
 ```json
 {"data":{"GenericError":null},"error":[{"message":"Generic errors"}]}
 ```
+
+The script auto-detects 206 and:
+- Prints clear warning: `⚠️  IP RATE LIMITED — HD limits ~500 req/IP/day`
+- Increases delay dynamically (2s → 10s max)
+- Aborts after 30 consecutive failures with a "switch IP" hint
 
 ### Best Practices
 
 1. **1 crawler per IP** — never run 2+ instances on the same machine
 2. **Residential IP preferred** — datacenter IPs get blocked after ~200 requests
-3. **If you get 206** — stop immediately, wait 10+ minutes, then resume
+3. **If you see 206** — stop, wait 10+ min or switch IP/VPN, then re-run (resume kicks in automatically)
 4. **Multiple machines** — use different IPs (different machines/VPNs), 1 instance each
-5. **Don't over-claim** — each shard is 500 products; datacenter IPs may not finish a full shard
 
 ### Estimated throughput
 
 | Setup | Speed | Full run (78 shards) |
 |-------|-------|---------------------|
 | 1 residential IP | ~15 min/shard | ~20 hours |
-| 1 datacenter IP | ~200 products then blocked | can't finish 1 shard |
-| 5 residential IPs | ~15 min/shard × parallel | ~4 hours |
-| 10 residential IPs | ~15 min/shard × parallel | ~2 hours |
+| 1 datacenter IP | ~200 products then blocked | partial shard + needs IP swap |
+| 5 residential IPs | parallel | ~4 hours |
+| 10 residential IPs | parallel | ~2 hours |
