@@ -2,6 +2,20 @@
 
 Collects image URLs + product metadata from ~38,500 Home Depot products, split into **78 shards** (~500 products each). **No images are downloaded** — only links + relationships.
 
+## v3: Batch GraphQL (50x fewer requests)
+
+Uses **GraphQL aliases** to fetch 50 products per request:
+```graphql
+query { p0: product(itemId:"X") {...} p1: product(itemId:"Y") {...} ... }
+```
+
+| Metric | v2 (old) | v3 (current) |
+|--------|----------|-------------|
+| Requests per shard | 500 | **10** |
+| Total requests (all 78 shards) | 38,545 | **~771** |
+| One residential IP can do | ~1 shard | **all 78 shards** |
+| Time per shard | ~15 min | **~30 sec** |
+
 Each machine claims one shard via git, runs it, pushes results back.
 
 ## Quick Start (each machine)
@@ -19,8 +33,9 @@ The script will:
 1. `git pull` to see what's already claimed
 2. Write `tasks/claims/shard_NNN.json` and push (atomic claim via git)
 3. If two machines race, one push wins — the other auto-retries next shard
-4. Collect image URLs + metadata to `tasks/links/shard_NNN_links.jsonl`
-5. Write `tasks/results/shard_NNN_done.json` and push when finished
+4. Fetch 50 products per GraphQL request using aliases (10 requests/shard)
+5. Collect image URLs + metadata to `tasks/links/shard_NNN_links.jsonl`
+6. Write `tasks/results/shard_NNN_done.json` and push when finished
 
 ## Output Format
 
@@ -79,8 +94,11 @@ Shard    Products   Status
 | Total products | 38,545 |
 | Shards | 78 × 500 products |
 | Est. total links | ~300,000 |
-| Est. time per shard | ~15 min (residential IP) |
-| With 10 machines | ~2 hours total |
+| Batch size | 50 products/request |
+| Requests per shard | ~10 |
+| Total requests (all shards) | ~771 |
+| Est. time per shard | ~30 sec |
+| One residential IP | can finish everything (~40 min) |
 
 ## Manual shard / dry run
 
