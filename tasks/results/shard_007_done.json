@@ -1,0 +1,15 @@
+{
+  "shard_id": "007",
+  "machine": "pluto-prod-zouyang-steve-train-1-0-oxylabs",
+  "started_at": "2026-04-22T03:52:39.090503",
+  "products_total": 500,
+  "products_ok": 499,
+  "products_failed": 1,
+  "products_no_media": 0,
+  "links_collected": 4362,
+  "total_requests": 500,
+  "total_206": 0,
+  "finished_at": "2026-04-22T03:56:23.333391",
+  "elapsed_seconds": 224.2,
+  "status": "done"
+}
