@@ -8,23 +8,24 @@ on:
         required: false
         default: '3'
 
-  # Also allow triggering via schedule (2x daily during off-peak)
   schedule:
-    - cron: '0 6 * * *'   # 6 AM UTC (11 PM PDT)
-    - cron: '0 14 * * *'  # 2 PM UTC (7 AM PDT)
+    - cron: '0 6 * * *'
+    - cron: '0 14 * * *'
 
 jobs:
-  # Run multiple parallel jobs — each gets a fresh IP!
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 50  # stay under 60 min to be safe
+    timeout-minutes: 50
     strategy:
       matrix:
         worker: [1, 2, 3, 4, 5]
-      fail-fast: false  # don't cancel others if one fails
+      fail-fast: false
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout with push token
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,14 +35,15 @@ jobs:
       - name: Install deps
         run: pip install curl_cffi
 
-      - name: Configure git
+      - name: Configure git for push
         run: |
           git config user.name "oyzh888"
           git config user.email "oyzh888@gmail.com"
-          git remote set-url origin https://oyzh888:${{ secrets.GH_TOKEN }}@github.com/oyzh888/thd-crawler.git
+          # Verify push works
+          git remote -v
 
       - name: Show IP
-        run: curl -s https://httpbin.org/ip
+        run: curl -s --max-time 5 https://httpbin.org/ip || echo "httpbin timeout"
 
       - name: Run crawler
         run: python crawler.py --auto --max-shards ${{ github.event.inputs.num_shards || '3' }}
