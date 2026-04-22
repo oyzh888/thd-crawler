@@ -1,0 +1,55 @@
+name: THD Crawl Shard
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: 'Number of shards to run'
+        required: false
+        default: '3'
+
+  # Also allow triggering via schedule (2x daily during off-peak)
+  schedule:
+    - cron: '0 6 * * *'   # 6 AM UTC (11 PM PDT)
+    - cron: '0 14 * * *'  # 2 PM UTC (7 AM PDT)
+
+jobs:
+  # Run multiple parallel jobs — each gets a fresh IP!
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50  # stay under 60 min to be safe
+    strategy:
+      matrix:
+        worker: [1, 2, 3, 4, 5]
+      fail-fast: false  # don't cancel others if one fails
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install curl_cffi
+
+      - name: Configure git
+        run: |
+          git config user.name "oyzh888"
+          git config user.email "oyzh888@gmail.com"
+          git remote set-url origin https://oyzh888:${{ secrets.GH_TOKEN }}@github.com/oyzh888/thd-crawler.git
+
+      - name: Show IP
+        run: curl -s https://httpbin.org/ip
+
+      - name: Run crawler
+        run: python crawler.py --auto --max-shards ${{ github.event.inputs.num_shards || '3' }}
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=== Links files ==="
+          find tasks/links -name "*.jsonl" -exec wc -l {} + 2>/dev/null || echo "No links yet"
+          echo "=== Results ==="
+          cat tasks/results/*.json 2>/dev/null || echo "No results yet"
