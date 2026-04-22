@@ -2,24 +2,34 @@
 """
 THD Distributed Image Crawler
 ==============================
-Each machine runs one shard. Images are saved locally.
-When done, a result file is written to tasks/results/.
+Task coordination via git files — no external API needed.
+
+Claiming a shard:
+    Each machine writes tasks/claims/shard_NNN.json and git pushes.
+    If two machines race for the same shard, one push wins; the other
+    gets a push-rejected error and automatically picks the next shard.
 
 Usage:
     pip install curl_cffi
-    python crawler.py --shard 001          # run shard 001
-    python crawler.py --shard 001 --dry-run  # just print what would be done
-    python crawler.py --list               # show all shards and their status
+
+    python crawler.py --auto       # auto-claim next available shard and run
+    python crawler.py --shard 001  # run a specific shard
+    python crawler.py --list       # show progress
+    python crawler.py --shard 001 --dry-run
 
 Output:
-    images/{shard_id}/{category}/{omsid}/  -- downloaded images
-    tasks/results/shard_{id}_done.json     -- completion marker (✓)
+    images/{shard_id}/{category}/{omsid}/*.jpg
+    tasks/claims/shard_{id}.json    (claim marker)
+    tasks/results/shard_{id}_done.json  (completion marker ✓)
 """
 
 import argparse
 import json
 import logging
+import os
 import re
+import socket
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -34,14 +44,15 @@ except ImportError:
 ROOT        = Path(__file__).resolve().parent
 TASKS_DIR   = ROOT / "tasks"
 SHARDS_DIR  = TASKS_DIR / "shards"
+CLAIMS_DIR  = TASKS_DIR / "claims"
 RESULTS_DIR = TASKS_DIR / "results"
 IMAGES_DIR  = ROOT / "images"
 
 GRAPHQL_URL = "https://www.homedepot.com/federation-gateway/graphql"
-PAGE_DELAY  = 1.5   # seconds between GraphQL calls
-CDN_DELAY   = 0.2   # seconds between image downloads
-IMAGE_SIZE  = 1000  # max resolution
-MIN_BYTES   = 2000  # discard images smaller than this
+PAGE_DELAY  = 1.5
+CDN_DELAY   = 0.2
+IMAGE_SIZE  = 1000
+MIN_BYTES   = 2000
 
 API_HEADERS = {
     "Accept": "application/json",
@@ -71,10 +82,104 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+def git(*args, check=True):
+    r = subprocess.run(["git", "-C", str(ROOT)] + list(args),
+                       capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout.strip(), r.returncode
+
+
+def git_pull():
+    try:
+        out, _ = git("pull", "--rebase")
+        log.info(f"git pull: {out.splitlines()[0] if out else 'ok'}")
+    except RuntimeError as e:
+        log.warning(f"git pull failed (continuing): {e}")
+
+
+def git_push_claim(shard_id):
+    """Write claim file, commit, push. Returns True if successful."""
+    CLAIMS_DIR.mkdir(parents=True, exist_ok=True)
+    claim_path = CLAIMS_DIR / f"shard_{shard_id}.json"
+    claim_path.write_text(json.dumps({
+        "shard_id": shard_id,
+        "machine":  socket.gethostname(),
+        "pid":      os.getpid(),
+        "claimed_at": datetime.now().isoformat(),
+    }, indent=2))
+
+    try:
+        git("add", str(claim_path))
+        git("commit", "-m", f"claim shard {shard_id} [{socket.gethostname()}]")
+        git("push")
+        log.info(f"Claimed shard {shard_id}")
+        return True
+    except RuntimeError as e:
+        # Push rejected means someone else claimed it first
+        log.info(f"Shard {shard_id} already claimed (push rejected), trying next...")
+        # Clean up local commit
+        git("reset", "HEAD~1", check=False)
+        claim_path.unlink(missing_ok=True)
+        git("pull", "--rebase", check=False)
+        return False
+
+
+def git_push_result(shard_id, result_path):
+    try:
+        git("add", str(result_path))
+        git("commit", "-m", f"done shard {shard_id} [{socket.gethostname()}]")
+        git("push")
+    except RuntimeError as e:
+        log.warning(f"Could not push result: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Auto-claim
+# ---------------------------------------------------------------------------
+
+def find_unclaimed_shard():
+    """Pull latest, return first shard_id with no claim and no result."""
+    git_pull()
+
+    manifest   = json.loads((TASKS_DIR / "manifest.json").read_text())
+    claimed    = {f.stem for f in CLAIMS_DIR.glob("shard_*.json")} if CLAIMS_DIR.exists() else set()
+    done       = {f.stem.replace("_done", "") for f in RESULTS_DIR.glob("shard_*_done.json")} if RESULTS_DIR.exists() else set()
+    taken      = claimed | {f"shard_{s}" for s in [r.replace("shard_", "") for r in done]}
+
+    for s in manifest["shards"]:
+        sid = f"shard_{s['shard_id']}"
+        if sid not in claimed and f"shard_{s['shard_id']}_done" not in {f.stem for f in RESULTS_DIR.glob("*.json")} if RESULTS_DIR.exists() else True:
+            if sid not in claimed:
+                return s["shard_id"]
+    return None
+
+
+def auto_claim():
+    """Find and atomically claim a shard. Returns shard_id or None."""
+    for attempt in range(10):
+        shard_id = find_unclaimed_shard()
+        if shard_id is None:
+            log.info("No unclaimed shards found — all done!")
+            return None
+        if git_push_claim(shard_id):
+            return shard_id
+        time.sleep(2)  # brief pause before retrying
+    log.error("Could not claim a shard after 10 attempts")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
+
 def sanitize(s, max_len=50):
     s = re.sub(r'[^\w\-]', '_', str(s))
-    s = re.sub(r'_+', '_', s).strip('_')
-    return s[:max_len]
+    return re.sub(r'_+', '_', s).strip('_')[:max_len]
 
 
 def graphql_fetch(session, omsid):
@@ -87,10 +192,8 @@ def graphql_fetch(session, omsid):
         try:
             r = session.post(
                 f"{GRAPHQL_URL}?opname=productClientOnlyProduct",
-                headers=API_HEADERS,
-                json=payload,
-                impersonate="chrome",
-                timeout=20,
+                headers=API_HEADERS, json=payload,
+                impersonate="chrome", timeout=20,
             )
         except Exception as e:
             return [], None, str(e)
@@ -103,42 +206,27 @@ def graphql_fetch(session, omsid):
         if r.status_code != 200:
             return [], None, f"HTTP {r.status_code}"
 
-        data = r.json()
+        data    = r.json()
         product = (data.get("data") or {}).get("product")
         if not product:
-            err = ""
-            if "errors" in data:
-                err = data["errors"][0].get("message", "")
-            return [], None, err or "no product data"
+            err = (data.get("errors") or [{}])[0].get("message", "no product data")
+            return [], None, err
 
-        ident = product.get("identifiers", {})
-        info = {
-            "brand": ident.get("brandName", ""),
-            "model": ident.get("modelNumber", ""),
-            "label": ident.get("productLabel", ""),
-        }
-
+        ident  = product.get("identifiers", {})
+        info   = {"brand": ident.get("brandName", ""), "label": ident.get("productLabel", "")}
         images = []
         for img in (product.get("media") or {}).get("images", []):
             url_tmpl = img.get("url", "")
             if not url_tmpl:
                 continue
-            sizes = img.get("sizes", [])
-            best = str(IMAGE_SIZE)
-            if isinstance(sizes, list):
-                numeric = [s for s in sizes if str(s).isdigit()]
-                if numeric:
-                    best = str(max(numeric, key=int))
-            url = url_tmpl.replace("<SIZE>", best)
-            images.append({
-                "url": url,
-                "type": img.get("type", ""),
-                "subtype": img.get("subType", ""),
-            })
-
+            sizes   = img.get("sizes", [])
+            numeric = [s for s in sizes if str(s).isdigit()] if isinstance(sizes, list) else []
+            best    = str(max(numeric, key=int)) if numeric else str(IMAGE_SIZE)
+            images.append({"url": url_tmpl.replace("<SIZE>", best),
+                           "type": img.get("type", ""), "subtype": img.get("subType", "")})
         return images, info, None
 
-    return [], None, "max retries exceeded"
+    return [], None, "max retries"
 
 
 def download_image(session, url, filepath):
@@ -147,51 +235,46 @@ def download_image(session, url, filepath):
         if r.status_code == 200 and len(r.content) >= MIN_BYTES:
             filepath.parent.mkdir(parents=True, exist_ok=True)
             filepath.write_bytes(r.content)
-            return True, len(r.content)
-        return False, f"HTTP {r.status_code}" if r.status_code != 200 else f"too small ({len(r.content)}B)"
-    except Exception as e:
-        return False, str(e)
+            return True
+        return False
+    except Exception:
+        return False
 
+
+# ---------------------------------------------------------------------------
+# Shard runner
+# ---------------------------------------------------------------------------
 
 def run_shard(shard_id, dry_run=False):
-    shard_file = SHARDS_DIR / f"shard_{shard_id}.json"
+    shard_file  = SHARDS_DIR / f"shard_{shard_id}.json"
+    result_file = RESULTS_DIR / f"shard_{shard_id}_done.json"
+
     if not shard_file.exists():
         log.error(f"Shard file not found: {shard_file}")
         sys.exit(1)
-
-    result_file = RESULTS_DIR / f"shard_{shard_id}_done.json"
     if result_file.exists():
-        log.info(f"Shard {shard_id} already completed. Delete {result_file} to re-run.")
+        log.info(f"Shard {shard_id} already completed.")
         return
 
-    shard = json.loads(shard_file.read_text())
+    shard    = json.loads(shard_file.read_text())
     products = shard["products"]
-    total_shards = shard["total_shards"]
+    log.info(f"=== Shard {shard_id}/{shard['total_shards']:03d} | {len(products)} products ===")
 
-    log.info(f"=== Shard {shard_id}/{total_shards:03d} | {len(products)} products ===")
-    log.info(f"Output: {IMAGES_DIR / shard_id}")
     if dry_run:
-        log.info("[DRY RUN] No requests will be made")
+        log.info("[DRY RUN] first 5 products:")
         for p in products[:5]:
-            log.info(f"  Would scrape: {p['omsid']} ({p['category']})")
-        log.info(f"  ... and {len(products)-5} more")
+            log.info(f"  {p['omsid']} ({p.get('category', '?')})")
         return
 
-    session = cffi_requests.Session()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    stats = {
-        "shard_id": shard_id,
-        "started_at": datetime.now().isoformat(),
-        "products_total": len(products),
-        "products_ok": 0,
-        "products_failed": 0,
-        "products_no_media": 0,
-        "images_downloaded": 0,
-        "images_failed": 0,
-        "errors": [],
+    session = cffi_requests.Session()
+    stats   = {
+        "shard_id": shard_id, "started_at": datetime.now().isoformat(),
+        "machine": socket.gethostname(),
+        "products_total": len(products), "products_ok": 0,
+        "products_failed": 0, "products_no_media": 0,
+        "images_downloaded": 0, "images_failed": 0,
     }
-
     consecutive_errors = 0
 
     for i, product in enumerate(products):
@@ -199,23 +282,20 @@ def run_shard(shard_id, dry_run=False):
         cat   = sanitize(product.get("category", "other"))
 
         if (i + 1) % 50 == 0:
-            pct = (i + 1) / len(products) * 100
-            remaining_h = (len(products) - i - 1) * PAGE_DELAY / 3600
-            log.info(f"[{i+1}/{len(products)}] {pct:.0f}% | ~{remaining_h:.1f}h left | {stats['images_downloaded']} imgs")
+            eta = (len(products) - i - 1) * PAGE_DELAY / 60
+            log.info(f"[{i+1}/{len(products)}] {(i+1)/len(products)*100:.0f}% | ~{eta:.0f}min | {stats['images_downloaded']} imgs")
 
         images, info, err = graphql_fetch(session, omsid)
 
         if err:
             consecutive_errors += 1
             stats["products_failed"] += 1
-            stats["errors"].append({"omsid": omsid, "error": err})
-            log.warning(f"  [{i+1}] FAIL {omsid}: {err[:80]}")
+            log.warning(f"  FAIL {omsid}: {err[:80]}")
             if consecutive_errors >= 30:
-                log.error("30 consecutive errors — aborting shard")
+                log.error("30 consecutive errors — aborting")
                 break
             if consecutive_errors >= 5:
-                backoff = min(60, consecutive_errors * 5)
-                time.sleep(backoff)
+                time.sleep(min(60, consecutive_errors * 5))
             time.sleep(PAGE_DELAY)
             continue
 
@@ -226,76 +306,91 @@ def run_shard(shard_id, dry_run=False):
             time.sleep(PAGE_DELAY)
             continue
 
-        # Download images
-        brand = sanitize(info.get("brand", "Unknown"))
+        brand   = sanitize(info.get("brand", "Unknown"))
         out_dir = IMAGES_DIR / shard_id / cat / omsid
-        dl_ok = 0
 
         for j, img in enumerate(images):
-            img_type = sanitize(img["type"])
-            fname = f"{brand}_{omsid}_{img_type}_{j}.jpg"
-            fpath = out_dir / fname
-
+            fpath = out_dir / f"{brand}_{omsid}_{sanitize(img['type'])}_{j}.jpg"
             if fpath.exists():
-                dl_ok += 1
+                stats["images_downloaded"] += 1
                 continue
-
-            ok, detail = download_image(session, img["url"], fpath)
-            if ok:
-                dl_ok += 1
+            if download_image(session, img["url"], fpath):
                 stats["images_downloaded"] += 1
             else:
                 stats["images_failed"] += 1
             time.sleep(CDN_DELAY)
 
         stats["products_ok"] += 1
-        log.debug(f"  [{i+1}] {omsid} -> {dl_ok}/{len(images)} imgs [{info.get('brand','')}]")
-
         time.sleep(PAGE_DELAY)
 
-    stats["finished_at"] = datetime.now().isoformat()
-    stats["status"] = "done"
+    stats.update({"finished_at": datetime.now().isoformat(), "status": "done"})
     result_file.write_text(json.dumps(stats, indent=2))
+    git_push_result(shard_id, result_file)
 
     log.info("=" * 55)
-    log.info(f"SHARD {shard_id} COMPLETE")
-    log.info(f"  Products ok:        {stats['products_ok']}")
-    log.info(f"  Products failed:    {stats['products_failed']}")
-    log.info(f"  Products no media:  {stats['products_no_media']}")
-    log.info(f"  Images downloaded:  {stats['images_downloaded']}")
-    log.info(f"  Result file:        {result_file}")
+    log.info(f"SHARD {shard_id} DONE — {stats['images_downloaded']} images downloaded")
     log.info("=" * 55)
 
+
+# ---------------------------------------------------------------------------
+# Progress list
+# ---------------------------------------------------------------------------
 
 def list_shards():
+    git_pull()
     manifest = json.loads((TASKS_DIR / "manifest.json").read_text())
-    done_files = {f.stem.replace("_done", "") for f in RESULTS_DIR.glob("shard_*_done.json")} if RESULTS_DIR.exists() else set()
+    claimed  = {}
+    if CLAIMS_DIR.exists():
+        for f in CLAIMS_DIR.glob("shard_*.json"):
+            try:
+                d = json.loads(f.read_text())
+                claimed[f.stem] = d.get("machine", "?")
+            except Exception:
+                claimed[f.stem] = "?"
 
-    total = manifest["n_shards"]
-    done  = len(done_files)
-    print(f"\nProgress: {done}/{total} shards done ({done/total*100:.1f}%)\n")
-    print(f"{'Shard':<8} {'Products':<10} {'Status'}")
-    print("-" * 35)
+    done = set()
+    if RESULTS_DIR.exists():
+        done = {f.stem.replace("_done", "") for f in RESULTS_DIR.glob("shard_*_done.json")}
+
+    total   = manifest["n_shards"]
+    n_done  = len(done)
+    n_claim = len(claimed) - n_done
+    print(f"\nProgress: {n_done}/{total} done | {n_claim} in-progress | {total-n_done-n_claim} pending\n")
+    print(f"{'Shard':<8} {'Products':<10} {'Status':<25}")
+    print("-" * 45)
     for s in manifest["shards"]:
         sid = f"shard_{s['shard_id']}"
-        status = "✓ done" if sid in done_files else "· pending"
+        if sid in done:
+            status = "✓ done"
+        elif sid in claimed:
+            status = f"⟳ {claimed[sid]}"
+        else:
+            status = "· pending"
         print(f"  {s['shard_id']}   {s['product_count']:<10} {status}")
     print()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="THD Distributed Image Crawler")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--shard", metavar="NNN", help="Shard ID to process (e.g. 001)")
-    group.add_argument("--list",  action="store_true", help="List all shards and their status")
-    parser.add_argument("--dry-run", action="store_true", help="Print plan without making requests")
+    group  = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--auto",  action="store_true", help="Auto-claim and run next pending shard")
+    group.add_argument("--shard", metavar="NNN",       help="Run a specific shard (e.g. 001)")
+    group.add_argument("--list",  action="store_true", help="Show all shards and status")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if args.list:
         list_shards()
+    elif args.auto:
+        shard_id = auto_claim()
+        if shard_id:
+            run_shard(shard_id, dry_run=args.dry_run)
     else:
-        shard_id = args.shard.zfill(3)
-        run_shard(shard_id, dry_run=args.dry_run)
+        run_shard(args.shard.zfill(3), dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

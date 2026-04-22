@@ -1,62 +1,57 @@
 # THD Distributed Image Crawler
 
-Scrapes ~38,500 Home Depot products across 78 shards. Each machine takes one shard (~500 products, ~15 min).
+Scrapes ~38,500 Home Depot products split into **78 shards** (~500 products each).
+Each machine claims one shard via git, runs it, pushes results back.
 
-## Quick Start
+## Quick Start (each machine)
 
 ```bash
-# 1. Install
+git clone https://github.com/oyzh888/thd-crawler.git
+cd thd-crawler
 pip install curl_cffi
 
-# 2. Pick any unclaimed shard (check list first)
-python crawler.py --list
-
-# 3. Run it
-python crawler.py --shard 001
+# Auto-claim next available shard and run:
+python crawler.py --auto
 ```
 
-Images saved to `images/NNN/{category}/{omsid}/*.jpg`
-Done marker written to `tasks/results/shard_NNN_done.json`
+That's it. The script will:
+1. `git pull` to see what's already claimed
+2. Write `tasks/claims/shard_NNN.json` and push (atomic claim)
+3. If two machines race for the same shard, one push wins — the other retries automatically
+4. Download all images to `images/NNN/{category}/{omsid}/`
+5. Write `tasks/results/shard_NNN_done.json` and push when finished
 
-## Check Overall Progress
+## Check Progress
 
 ```bash
 python crawler.py --list
 ```
 
 ```
-Progress: 12/78 shards done (15.4%)
+Progress: 12/78 done | 3 in-progress | 63 pending
 
 Shard    Products   Status
------------------------------------
+---------------------------------------------
   001    500        ✓ done
   002    500        ✓ done
-  003    500        · pending
+  003    500        ⟳ MacBook-Pro-Minhou    ← someone is running this
+  004    500        · pending
   ...
 ```
 
 ## Stats
 
-| Item | Count |
-|------|-------|
+| | |
+|---|---|
 | Total products | 38,545 |
-| Shards | 78 |
-| Products per shard | ~500 |
-| Est. images per product | ~8–10 |
-| **Est. total images** | **~350,000** |
+| Shards | 78 × 500 products |
+| Est. images | ~350,000 |
 | Est. time per shard | ~15 min |
-| Est. time (78 machines parallel) | ~15 min total |
+| With 10 machines | ~2 hours total |
 
-## Coordinate with Team
+## Manual shard
 
-- Check `--list` to see which shards are pending
-- Claim a shard number with your team (e.g. via Slack)
-- Run it, result auto-saved when done
-- Push `tasks/results/shard_NNN_done.json` back to repo so others can see progress
-
-## Notes
-
-- Supports **resume**: already-downloaded images are skipped, re-run a shard safely
-- Rate limiting: uses `curl_cffi` Chrome impersonation + 1.5s delay between products
-- If you hit HTTP 206 (rate limit), the script backs off automatically
-- Images are 1000px max resolution JPEG
+```bash
+python crawler.py --shard 007          # run shard 007 specifically
+python crawler.py --shard 007 --dry-run  # preview without requests
+```
