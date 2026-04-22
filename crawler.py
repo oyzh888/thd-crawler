@@ -58,8 +58,9 @@ RESULTS_DIR = TASKS_DIR / "results"
 LINKS_DIR   = TASKS_DIR / "links"
 
 GRAPHQL_URL = "https://www.homedepot.com/federation-gateway/graphql"
-PAGE_DELAY  = 1.5   # seconds between requests
-IMAGE_SIZE  = 1000  # preferred resolution
+PAGE_DELAY      = 2.0   # seconds between requests
+PAGE_DELAY_MAX  = 10.0  # max delay after repeated rate limits
+IMAGE_SIZE      = 1000  # preferred resolution
 
 API_HEADERS = {
     "Accept": "application/json",
@@ -189,8 +190,12 @@ def graphql_fetch(session, omsid):
             return [], None, str(e)
 
         if r.status_code == 206:
-            wait = 15 * (attempt + 1)
-            log.warning(f"  Rate limited (206), waiting {wait}s")
+            wait = 30 * (attempt + 1)
+            log.warning(
+                f"  ⚠️  IP RATE LIMITED (HTTP 206) — HD limits ~500 req/IP/day. "
+                f"Backing off {wait}s (attempt {attempt+1}/3). "
+                f"If this persists, switch IP/VPN."
+            )
             time.sleep(wait)
             continue
         if r.status_code != 200:
@@ -271,6 +276,8 @@ def run_shard(shard_id, dry_run=False):
     }
 
     consecutive_errors = 0
+    current_delay = PAGE_DELAY
+    rate_limit_hits = 0
 
     with links_file.open("w", encoding="utf-8") as f:
         for i, product in enumerate(products):
@@ -279,24 +286,41 @@ def run_shard(shard_id, dry_run=False):
             category = product.get("category", "other")
 
             if (i + 1) % 100 == 0:
-                eta = (len(products) - i - 1) * PAGE_DELAY / 60
-                log.info(f"[{i+1}/{len(products)}] {(i+1)/len(products)*100:.0f}% | ~{eta:.0f}min | {stats['links_collected']} links")
+                eta = (len(products) - i - 1) * current_delay / 60
+                log.info(
+                    f"[{i+1}/{len(products)}] {(i+1)/len(products)*100:.0f}% | "
+                    f"~{eta:.0f}min | {stats['links_collected']} links | "
+                    f"delay={current_delay:.1f}s | rate_limits={rate_limit_hits}"
+                )
 
             images, info, err = graphql_fetch(session, omsid)
 
             if err:
                 consecutive_errors += 1
                 stats["products_failed"] += 1
-                log.warning(f"  FAIL {omsid}: {err[:80]}")
+                if "206" in str(err) or "max retries" in str(err):
+                    rate_limit_hits += 1
+                    # Slow down globally when rate limited
+                    current_delay = min(PAGE_DELAY_MAX, current_delay * 1.5)
+                    log.warning(
+                        f"  ⚠️  Rate limit detected — slowing to {current_delay:.1f}s/req. "
+                        f"Total rate limit hits: {rate_limit_hits}. "
+                        f"Consider switching IP if this keeps happening."
+                    )
+                else:
+                    log.warning(f"  FAIL {omsid}: {err[:80]}")
                 if consecutive_errors >= 30:
-                    log.error("30 consecutive errors — aborting")
+                    log.error("30 consecutive errors — aborting shard. Switch IP and re-run.")
                     break
                 if consecutive_errors >= 5:
-                    time.sleep(min(60, consecutive_errors * 5))
-                time.sleep(PAGE_DELAY)
+                    time.sleep(min(120, consecutive_errors * 10))
+                time.sleep(current_delay)
                 continue
 
             consecutive_errors = 0
+            # Gradually recover delay after clean run
+            if current_delay > PAGE_DELAY and i % 20 == 0:
+                current_delay = max(PAGE_DELAY, current_delay * 0.9)
 
             if not images:
                 stats["products_no_media"] += 1
@@ -317,9 +341,9 @@ def run_shard(shard_id, dry_run=False):
                 stats["links_collected"] += 1
 
             stats["products_ok"] += 1
-            time.sleep(PAGE_DELAY)
+            time.sleep(current_delay)
 
-    stats.update({"finished_at": datetime.now().isoformat(), "status": "done"})
+    stats.update({"rate_limit_hits": rate_limit_hits, "finished_at": datetime.now().isoformat(), "status": "done"})
     result_file.write_text(json.dumps(stats, indent=2))
     git_push_result(shard_id, [result_file, links_file])
 
