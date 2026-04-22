@@ -1,0 +1,17 @@
+{
+  "shard_id": "074",
+  "machine": "ZhihaoSteves-MacBook-Pro.local",
+  "started_at": "2026-04-22T07:30:40.063901",
+  "products_total": 500,
+  "products_ok": 11,
+  "products_failed": 489,
+  "products_no_media": 0,
+  "links_collected": 122,
+  "batch_size": 50,
+  "finished_at": "2026-04-22T07:31:19.306234",
+  "status": "done",
+  "total_requests": 53,
+  "total_products_fetched": 2500,
+  "total_206": 3,
+  "cooldowns": 0
+}
