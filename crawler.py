@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-THD Distributed Link Collector — v2 with Smart Rate Limit Handling
-===================================================================
-Key improvement: detects 206 rate limit, auto-pauses until IP recovers,
-then resumes. Single IP does ~180 req → pause 10-20 min → repeat.
-Runs continuously through multiple shards with --auto.
+THD Distributed Link Collector — v3 Batch GraphQL
+===================================================
+Key improvement: uses GraphQL aliases to fetch 50 products per request.
+  - 500 products/shard ÷ 50/batch = only 10 requests per shard
+  - Rate limit at ~200 req/IP → 1 IP can do 200×50 = 10,000 products
+  - One MacBook can finish all 78 shards with ~770 total requests
 
 Usage:
     pip install curl_cffi
@@ -45,12 +46,13 @@ LINKS_DIR   = TASKS_DIR / "links"
 GRAPHQL_URL = "https://www.homedepot.com/federation-gateway/graphql"
 IMAGE_SIZE  = 1000
 
-# --- Rate limit tuning ---
-BURST_SIZE     = 180    # requests before proactive pause (HD triggers 206 at ~200)
-BURST_DELAY    = 2.5    # seconds between requests in a burst
+# --- Batch settings ---
+BATCH_SIZE     = 50     # products per GraphQL request (via aliases)
+BURST_LIMIT    = 180    # requests before proactive pause
+BURST_DELAY    = 3.0    # seconds between batch requests
 COOLDOWN_PROBE = 120    # seconds between probe attempts during cooldown
 COOLDOWN_MAX   = 1800   # max cooldown (30 min)
-JITTER         = 0.5    # ± random jitter on delays
+JITTER         = 0.5    # random jitter on delays
 
 API_HEADERS = {
     "Accept": "application/json",
@@ -60,12 +62,9 @@ API_HEADERS = {
     "Referer": "https://www.homedepot.com/",
 }
 
-PRODUCT_MEDIA_QUERY = """query productClientOnlyProduct($itemId: String!) {
-  product(itemId: $itemId) {
-    itemId
-    identifiers { productLabel brandName modelNumber }
-    media { images { url type subType sizes } }
-  }
+# Single-product query for probing rate limit recovery
+PROBE_QUERY = """query productClientOnlyProduct($itemId: String!) {
+  product(itemId: $itemId) { itemId }
 }"""
 
 logging.basicConfig(
@@ -77,29 +76,26 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Rate Limiter — the core anti-206 logic
+# Rate Limiter
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """Tracks request budget per IP. Pauses proactively before 206,
-    and reactively recovers if 206 is hit."""
-
     def __init__(self):
         self.requests_in_burst = 0
         self.total_requests = 0
+        self.total_products = 0  # track products, not just requests
         self.total_206 = 0
         self.cooldowns = 0
 
-    def pre_request(self):
-        """Called before each request. Proactively pauses if near limit."""
-        if self.requests_in_burst >= BURST_SIZE:
+    def pre_request(self, batch_size=1):
+        if self.requests_in_burst >= BURST_LIMIT:
             self._proactive_cooldown()
 
-    def post_request(self, status_code):
-        """Called after request. Returns True if OK."""
+    def post_request(self, status_code, products_in_batch=1):
         self.total_requests += 1
         if status_code == 200:
             self.requests_in_burst += 1
+            self.total_products += products_in_batch
             return True
         elif status_code == 206:
             self.total_206 += 1
@@ -108,22 +104,19 @@ class RateLimiter:
         return False
 
     def _proactive_cooldown(self):
-        """Pause BEFORE hitting rate limit. Shorter wait."""
-        pause = random.uniform(600, 900)  # 10-15 min
+        pause = random.uniform(600, 900)
         self.cooldowns += 1
         log.info(
-            f"💤 Proactive pause after {self.requests_in_burst} requests. "
-            f"Sleeping {pause/60:.0f} min. "
-            f"(Total: {self.total_requests} req, {self.cooldowns} pauses)"
+            f"  Proactive pause after {self.requests_in_burst} requests "
+            f"({self.total_products} products). Sleeping {pause/60:.0f} min..."
         )
         time.sleep(pause)
         self.requests_in_burst = 0
 
     def _reactive_cooldown(self):
-        """Got 206. Wait until IP recovers, probing periodically."""
         log.warning(
-            f"🔴 Rate limited (206) at {self.requests_in_burst} requests. "
-            f"Probing every {COOLDOWN_PROBE}s until recovered..."
+            f"  Rate limited (206) at {self.requests_in_burst} requests. "
+            f"Probing every {COOLDOWN_PROBE}s..."
         )
         self.requests_in_burst = 0
         waited = 0
@@ -139,25 +132,137 @@ class RateLimiter:
                     json={
                         "operationName": "productClientOnlyProduct",
                         "variables": {"itemId": "203164241"},
-                        "query": PRODUCT_MEDIA_QUERY,
+                        "query": PROBE_QUERY,
                     },
                     impersonate="chrome", timeout=10,
                 )
                 if resp.status_code == 200:
-                    log.info(f"🟢 Recovered after {waited/60:.0f} min!")
+                    log.info(f"  Recovered after {waited/60:.0f} min!")
                     return
                 log.info(f"  Still 206... ({waited/60:.0f} min)")
             except Exception:
                 log.info(f"  Probe failed... ({waited/60:.0f} min)")
 
-        log.warning(f"⚠️  Not recovered after {COOLDOWN_MAX/60:.0f} min. Continuing anyway.")
+        log.warning(f"  Not recovered after {COOLDOWN_MAX/60:.0f} min. Continuing anyway.")
 
     def stats_dict(self):
         return {
             "total_requests": self.total_requests,
+            "total_products_fetched": self.total_products,
             "total_206": self.total_206,
             "cooldowns": self.cooldowns,
         }
+
+
+# ---------------------------------------------------------------------------
+# Batch GraphQL — the key optimization
+# ---------------------------------------------------------------------------
+
+def build_batch_query(product_ids):
+    """Build one GraphQL query that fetches N products via aliases.
+
+    Example output (N=3):
+        {
+          p0: product(itemId: "203164241") { itemId identifiers { ... } media { ... } }
+          p1: product(itemId: "314427520") { itemId identifiers { ... } media { ... } }
+          p2: product(itemId: "325544370") { itemId identifiers { ... } media { ... } }
+        }
+
+    This counts as 1 HTTP request against rate limit, but returns N products.
+    """
+    parts = []
+    for i, pid in enumerate(product_ids):
+        parts.append(
+            f'p{i}: product(itemId: "{pid}") {{ '
+            f'itemId '
+            f'identifiers {{ productLabel brandName modelNumber }} '
+            f'media {{ images {{ url type subType sizes }} }} '
+            f'}}'
+        )
+    return "{ " + " ".join(parts) + " }"
+
+
+def parse_batch_response(data, product_ids):
+    """Parse batch response into per-product results.
+
+    Returns: list of (omsid, images_list, info_dict, error_or_None)
+    """
+    results = []
+    gql_data = data.get("data", {})
+
+    for i, pid in enumerate(product_ids):
+        product = gql_data.get(f"p{i}")
+        if not product:
+            results.append((pid, [], None, "no data"))
+            continue
+
+        ident = product.get("identifiers") or {}
+        info = {
+            "brand": ident.get("brandName", ""),
+            "model": ident.get("modelNumber", ""),
+            "label": ident.get("productLabel", ""),
+        }
+
+        images = []
+        for img in (product.get("media") or {}).get("images", []):
+            url_tmpl = img.get("url", "")
+            if not url_tmpl:
+                continue
+            sizes = img.get("sizes", [])
+            numeric = [s for s in sizes if str(s).isdigit()] if isinstance(sizes, list) else []
+            best = str(max(numeric, key=int)) if numeric else str(IMAGE_SIZE)
+            images.append({
+                "img_url":     url_tmpl.replace("<SIZE>", best),
+                "img_type":    img.get("type", ""),
+                "img_subtype": img.get("subType", ""),
+            })
+
+        results.append((pid, images, info, None))
+
+    return results
+
+
+def graphql_batch_fetch(session, product_ids, rate_limiter):
+    """Fetch N products in one GraphQL request using aliases.
+
+    Returns: list of (omsid, images, info, error)
+    """
+    query = build_batch_query(product_ids)
+    rate_limiter.pre_request(len(product_ids))
+
+    for attempt in range(3):
+        try:
+            r = session.post(
+                f"{GRAPHQL_URL}?opname=batchProducts",
+                headers=API_HEADERS,
+                json={"query": query},
+                impersonate="chrome",
+                timeout=30,
+            )
+        except Exception as e:
+            return [(pid, [], None, str(e)) for pid in product_ids]
+
+        if r.status_code == 206:
+            rate_limiter.post_request(206, 0)
+            continue
+
+        rate_limiter.post_request(r.status_code, len(product_ids))
+
+        if r.status_code != 200:
+            return [(pid, [], None, f"HTTP {r.status_code}") for pid in product_ids]
+
+        try:
+            data = r.json()
+        except Exception:
+            return [(pid, [], None, "JSON parse error") for pid in product_ids]
+
+        if "errors" in data and not data.get("data"):
+            err = data["errors"][0].get("message", "unknown error") if data["errors"] else "unknown"
+            return [(pid, [], None, err) for pid in product_ids]
+
+        return parse_batch_response(data, product_ids)
+
+    return [(pid, [], None, "max retries") for pid in product_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +339,7 @@ def auto_claim():
     for _ in range(10):
         shard_id = find_unclaimed_shard()
         if shard_id is None:
-            log.info("No unclaimed shards — all done!")
+            log.info("No unclaimed shards found — all done!")
             return None
         if git_push_claim(shard_id):
             return shard_id
@@ -244,72 +349,7 @@ def auto_claim():
 
 
 # ---------------------------------------------------------------------------
-# GraphQL fetch
-# ---------------------------------------------------------------------------
-
-def graphql_fetch(session, omsid, rate_limiter):
-    """Fetch product data. Rate limiter handles 206 automatically."""
-    payload = {
-        "operationName": "productClientOnlyProduct",
-        "variables": {"itemId": omsid},
-        "query": PRODUCT_MEDIA_QUERY,
-    }
-
-    rate_limiter.pre_request()
-
-    for attempt in range(3):
-        try:
-            r = session.post(
-                f"{GRAPHQL_URL}?opname=productClientOnlyProduct",
-                headers=API_HEADERS, json=payload,
-                impersonate="chrome", timeout=20,
-            )
-        except Exception as e:
-            return [], None, str(e)
-
-        if r.status_code == 206:
-            rate_limiter.post_request(206)
-            continue  # rate limiter already waited; retry
-
-        rate_limiter.post_request(r.status_code)
-
-        if r.status_code != 200:
-            return [], None, f"HTTP {r.status_code}"
-
-        data    = r.json()
-        product = (data.get("data") or {}).get("product")
-        if not product:
-            err = (data.get("errors") or [{}])[0].get("message", "no product data")
-            return [], None, err
-
-        ident = product.get("identifiers", {})
-        info  = {
-            "brand": ident.get("brandName", ""),
-            "model": ident.get("modelNumber", ""),
-            "label": ident.get("productLabel", ""),
-        }
-
-        images = []
-        for img in (product.get("media") or {}).get("images", []):
-            url_tmpl = img.get("url", "")
-            if not url_tmpl:
-                continue
-            sizes   = img.get("sizes", [])
-            numeric = [s for s in sizes if str(s).isdigit()] if isinstance(sizes, list) else []
-            best    = str(max(numeric, key=int)) if numeric else str(IMAGE_SIZE)
-            images.append({
-                "img_url":    url_tmpl.replace("<SIZE>", best),
-                "img_type":   img.get("type", ""),
-                "img_subtype": img.get("subType", ""),
-            })
-
-        return images, info, None
-
-    return [], None, "max retries"
-
-
-# ---------------------------------------------------------------------------
-# Shard runner
+# Shard runner (batch mode)
 # ---------------------------------------------------------------------------
 
 def run_shard(shard_id, dry_run=False, rate_limiter=None):
@@ -325,12 +365,15 @@ def run_shard(shard_id, dry_run=False, rate_limiter=None):
 
     shard    = json.loads(shard_file.read_text())
     products = shard["products"]
-    log.info(f"=== Shard {shard_id}/{shard['total_shards']:03d} | {len(products)} products (links only) ===")
+    n_batches = (len(products) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    log.info(f"=== Shard {shard_id}/{shard['total_shards']:03d} | "
+             f"{len(products)} products | {n_batches} batches of {BATCH_SIZE} ===")
 
     if dry_run:
-        log.info("[DRY RUN] first 5 products:")
+        log.info(f"[DRY RUN] {n_batches} GraphQL requests needed (vs {len(products)} in v2)")
         for p in products[:5]:
-            log.info(f"  {p['omsid']} ({p.get('category','?')}) — {p['url']}")
+            log.info(f"  {p['omsid']} ({p.get('category','?')})")
         return rate_limiter
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -352,7 +395,7 @@ def run_shard(shard_id, dry_run=False, rate_limiter=None):
                 except Exception:
                     pass
         if processed:
-            log.info(f"Resume: {len(processed)} products done ({existing_links} links). Continuing...")
+            log.info(f"Resume: {len(processed)} products done ({existing_links} links).")
 
     session = cffi_requests.Session()
     stats = {
@@ -364,63 +407,71 @@ def run_shard(shard_id, dry_run=False, rate_limiter=None):
         "products_failed":   0,
         "products_no_media": 0,
         "links_collected":   existing_links,
+        "batch_size":        BATCH_SIZE,
     }
-    consecutive_errors = 0
 
+    # Build product lookup for metadata
+    product_meta = {p["omsid"]: p for p in products}
+
+    # Filter out already-processed
+    remaining = [p for p in products if p["omsid"] not in processed]
+    if not remaining:
+        log.info(f"All {len(products)} products already processed.")
+    else:
+        log.info(f"{len(remaining)} products remaining → {(len(remaining) + BATCH_SIZE - 1) // BATCH_SIZE} requests")
+
+    # Process in batches
     with links_file.open("a", encoding="utf-8") as f:
-        for i, product in enumerate(products):
-            omsid = product["omsid"]
-            if omsid in processed:
-                continue
+        for batch_idx in range(0, len(remaining), BATCH_SIZE):
+            batch = remaining[batch_idx:batch_idx + BATCH_SIZE]
+            batch_ids = [p["omsid"] for p in batch]
+            batch_num = batch_idx // BATCH_SIZE + 1
+            total_batches = (len(remaining) + BATCH_SIZE - 1) // BATCH_SIZE
 
-            page_url = product.get("url", f"https://www.homedepot.com/p/{omsid}")
-            category = product.get("category", "other")
+            log.info(
+                f"  Batch {batch_num}/{total_batches} "
+                f"({len(batch_ids)} products) | "
+                f"req={rate_limiter.total_requests} "
+                f"links={stats['links_collected']} "
+                f"burst={rate_limiter.requests_in_burst}/{BURST_LIMIT}"
+            )
 
-            if (i + 1) % 50 == 0:
-                log.info(
-                    f"[{i+1}/{len(products)}] {(i+1)/len(products)*100:.0f}% | "
-                    f"{stats['links_collected']} links | "
-                    f"burst={rate_limiter.requests_in_burst}/{BURST_SIZE} | "
-                    f"206s={rate_limiter.total_206} | pauses={rate_limiter.cooldowns}"
-                )
+            results = graphql_batch_fetch(session, batch_ids, rate_limiter)
 
-            images, info, err = graphql_fetch(session, omsid, rate_limiter)
+            for omsid, images, info, err in results:
+                meta = product_meta.get(omsid, {})
+                page_url = meta.get("url", f"https://www.homedepot.com/p/{omsid}")
+                category = meta.get("category", "other")
 
-            if err:
-                consecutive_errors += 1
-                stats["products_failed"] += 1
-                if consecutive_errors >= 50:
-                    log.error("50 consecutive errors — aborting shard.")
-                    break
-                if "max retries" not in str(err):
-                    log.warning(f"  FAIL {omsid}: {err[:80]}")
-                delay = BURST_DELAY + random.uniform(-JITTER, JITTER)
-                time.sleep(max(0.5, delay))
-                continue
+                if err:
+                    stats["products_failed"] += 1
+                    continue
 
-            consecutive_errors = 0
-            if not images:
-                stats["products_no_media"] += 1
-                time.sleep(BURST_DELAY + random.uniform(-JITTER, JITTER))
-                continue
+                if not images:
+                    stats["products_no_media"] += 1
+                    continue
 
-            for img in images:
-                row = {
-                    "omsid":    omsid,
-                    "page_url": page_url,
-                    "category": category,
-                    "brand":    info.get("brand", ""),
-                    "model":    info.get("model", ""),
-                    "label":    info.get("label", ""),
-                    **img,
-                }
-                f.write(json.dumps(row) + "\n")
-                stats["links_collected"] += 1
+                for img in images:
+                    row = {
+                        "omsid":    omsid,
+                        "page_url": page_url,
+                        "category": category,
+                        "brand":    info.get("brand", ""),
+                        "model":    info.get("model", ""),
+                        "label":    info.get("label", ""),
+                        **img,
+                    }
+                    f.write(json.dumps(row) + "\n")
+                    stats["links_collected"] += 1
+
+                stats["products_ok"] += 1
+
             f.flush()
             os.fsync(f.fileno())
-            processed.add(omsid)
-            stats["products_ok"] += 1
-            time.sleep(BURST_DELAY + random.uniform(-JITTER, JITTER))
+
+            # Delay between batches
+            delay = BURST_DELAY + random.uniform(-JITTER, JITTER)
+            time.sleep(max(1.0, delay))
 
     stats.update({
         "finished_at": datetime.now().isoformat(),
@@ -431,8 +482,10 @@ def run_shard(shard_id, dry_run=False, rate_limiter=None):
     git_push_result(shard_id, [result_file, links_file])
 
     log.info("=" * 55)
-    log.info(f"SHARD {shard_id} DONE — {stats['links_collected']} links")
-    log.info(f"  Rate: {rate_limiter.total_206} 206s, {rate_limiter.cooldowns} cooldowns")
+    log.info(
+        f"SHARD {shard_id} DONE — {stats['links_collected']} links "
+        f"in {rate_limiter.total_requests} requests"
+    )
     log.info("=" * 55)
     return rate_limiter
 
@@ -467,17 +520,18 @@ def list_shards():
     n_run   = sum(1 for k in claimed if k not in done_stats)
     total_links = sum(done_stats.values())
 
-    print(f"\nProgress: {n_done}/{total} done | {n_run} running | {total-n_done-n_run} pending | {total_links:,} links collected\n")
+    print(f"\nProgress: {n_done}/{total} done | {n_run} running | "
+          f"{total-n_done-n_run} pending | {total_links:,} links collected\n")
     print(f"{'Shard':<8} {'Products':<10} {'Status':<30}")
     print("-" * 50)
     for s in manifest["shards"]:
         sid = f"shard_{s['shard_id']}"
         if sid in done_stats:
-            status = f"✓ done ({done_stats[sid]:,} links)"
+            status = f"done ({done_stats[sid]:,} links)"
         elif sid in claimed:
-            status = f"⟳ {claimed[sid]}"
+            status = f"running [{claimed[sid][:25]}]"
         else:
-            status = "· pending"
+            status = "pending"
         print(f"  {s['shard_id']}   {s['product_count']:<10} {status}")
     print()
 
@@ -487,10 +541,12 @@ def list_shards():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="THD Distributed Link Collector v2")
+    global BATCH_SIZE
+    parser = argparse.ArgumentParser(
+        description="THD Link Collector v3 — batch GraphQL (50 products/request)")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--auto",  action="store_true",
-                       help="Claim shards and run continuously until all done")
+                       help="Claim shards and run continuously")
     group.add_argument("--shard", metavar="NNN",
                        help="Run specific shard (e.g. 001)")
     group.add_argument("--list",  action="store_true",
@@ -498,7 +554,11 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--max-shards", type=int, default=999,
                         help="Max shards to run (default: all)")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help=f"Products per GraphQL request (default: {BATCH_SIZE})")
     args = parser.parse_args()
+
+    BATCH_SIZE = args.batch_size
 
     if args.list:
         list_shards()
@@ -513,8 +573,13 @@ def main():
                 shard_id, dry_run=args.dry_run, rate_limiter=rate_limiter
             ) or rate_limiter
             done += 1
-            log.info(f"✅ {done} shards completed. Claiming next...")
-        log.info(f"🏁 Finished {done} shards. Total: {rate_limiter.total_requests} req, {rate_limiter.total_206} 206s")
+            log.info(f"  {done} shards done. Claiming next...")
+        log.info(
+            f"Finished {done} shards. "
+            f"{rate_limiter.total_requests} requests, "
+            f"{rate_limiter.total_products} products, "
+            f"{rate_limiter.total_206} rate limits"
+        )
     else:
         run_shard(args.shard.zfill(3), dry_run=args.dry_run)
 
